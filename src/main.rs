@@ -15,12 +15,24 @@ fn main() {
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
-                println!("accepted new connection");
-                stream.write_all(b"+PONG\r\n").unwrap();
+                let mut buf = [0; 1024];
+
+                loop {
+                    let n = match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(e) => {
+                            eprintln!("read error: {e}");
+                            break;
+                        }
+                    };
+
+                    if buf[..n].eq(b"*1\r\n$4\r\nPING\r\n") {
+                        _ = stream.write_all(b"+PONG\r\n");
+                    }
+                }
             }
-            Err(e) => {
-                println!("error: {}", e);
-            }
+            Err(e) => eprintln!("accept error: {e}"),
         }
     }
 }
