@@ -14,7 +14,17 @@ use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction, generic::Generi
 struct ServerData {
     next_id: usize,
     handle: LoopHandle<'static, ServerData>,
+    store: HashMap<String, String>,
 }
+
+const ECHO_PREFIX: &[u8; 14] = b"*2\r\n$4\r\nECHO\r\n";
+const SET_PREFIX: &[u8; 13] = b"*3\r\n$3\r\nSET\r\n";
+const GET_PREFIX: &[u8; 13] = b"*2\r\n$3\r\nGET\r\n";
+const PING_PREFIX: &[u8; 14] = b"*1\r\n$4\r\nPING\r\n";
+
+const PONG_RESPONSE: &[u8; 7] = b"+PONG\r\n";
+const NULL_RESPONSE: &[u8; 5] = b"$-1\r\n";
+const OK_RESPONSE: &[u8; 5] = b"+OK\r\n";
 
 fn main() -> Result<()> {
     let mut event_loop: EventLoop<'static, ServerData> = EventLoop::try_new()?;
@@ -45,6 +55,7 @@ fn main() -> Result<()> {
     let mut shared = ServerData {
         next_id: 0,
         handle: handle.clone(),
+        store: HashMap::new(),
     };
 
     event_loop.run(None, &mut shared, |_data| {})?;
@@ -55,7 +66,7 @@ fn main() -> Result<()> {
 fn register_client(handle: LoopHandle<'static, ServerData>, stream: TcpStream) {
     _ = handle.insert_source(
         Generic::new(stream, Interest::READ, Mode::Edge),
-        |_readiness, stream, _data: &mut ServerData| {
+        |_readiness, stream, data: &mut ServerData| {
             let mut buf = [0; 1024];
             let mut tcp: &TcpStream = stream.deref();
 
@@ -66,14 +77,59 @@ fn register_client(handle: LoopHandle<'static, ServerData>, stream: TcpStream) {
                 Err(_) => return Ok(PostAction::Remove),
             };
 
-            let echo = b"*2\r\n$4\r\nECHO\r\n";
-            if buf.starts_with(echo) {
-                _ = tcp.write_all(&buf[echo.len()..n])
+            if buf.starts_with(SET_PREFIX) {
+                match parse_kv(&buf[SET_PREFIX.len()..n]) {
+                    Some((key, value)) => {
+                        data.store.insert(key, value);
+                        _ = tcp.write_all(OK_RESPONSE);
+                    }
+                    None => _ = tcp.write_all(NULL_RESPONSE),
+                }
+            } else if buf.starts_with(GET_PREFIX) {
+                match parse_v(&buf[GET_PREFIX.len()..n]) {
+                    Some(key) => {
+                        let value = data.store.get(&key);
+                        match value {
+                            Some(v) => {
+                                _ = tcp.write_all(format!("${}\r\n{}\r\n", v.len(), v).as_bytes())
+                            }
+                            None => _ = tcp.write_all(NULL_RESPONSE),
+                        }
+                    }
+                    None => _ = tcp.write_all(NULL_RESPONSE),
+                }
+            } else if buf.starts_with(ECHO_PREFIX) {
+                _ = tcp.write_all(&buf[ECHO_PREFIX.len()..n])
+            } else if buf.starts_with(PING_PREFIX) {
+                _ = tcp.write_all(PONG_RESPONSE);
             } else {
-                _ = tcp.write_all(b"+PONG\r\n");
+                _ = tcp.write_all(NULL_RESPONSE);
             }
 
             Ok(PostAction::Continue)
         },
     );
+}
+
+// *3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n
+
+// input: $3\r\nkey\r\n$5\r\nvalue\r\n
+fn parse_kv(buf: &[u8]) -> Option<(String, String)> {
+    // buf: $3\r\nkey\r\n$5\r\nvalue\r\n
+    let s = std::str::from_utf8(buf)
+        .ok()?
+        .split("\r\n")
+        .collect::<Vec<&str>>();
+
+    Some((s.get(1)?.to_string(), s.get(3)?.to_string()))
+}
+
+// input: $3\r\nkey\r\n
+fn parse_v(buf: &[u8]) -> Option<String> {
+    let s = std::str::from_utf8(buf)
+        .ok()?
+        .split("\r\n")
+        .collect::<Vec<&str>>();
+
+    Some(s.get(1)?.to_string())
 }
