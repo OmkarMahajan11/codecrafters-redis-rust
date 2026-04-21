@@ -1,24 +1,32 @@
 #![allow(unused_imports)]
+use core::time;
 use std::{
     collections::HashMap,
     io::{self, Read, Write},
     net::{TcpListener, TcpStream},
     ops::Deref,
     thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
 
 use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction, generic::Generic};
 
+struct Entry {
+    value: String,
+    expiry: Option<Instant>,
+}
+
 struct ServerData {
     next_id: usize,
     handle: LoopHandle<'static, ServerData>,
-    store: HashMap<String, String>,
+    store: HashMap<String, Entry>,
 }
 
 const ECHO_PREFIX: &[u8; 14] = b"*2\r\n$4\r\nECHO\r\n";
 const SET_PREFIX: &[u8; 13] = b"*3\r\n$3\r\nSET\r\n";
+const SET_EXP_PREFIX: &[u8; 13] = b"*5\r\n$3\r\nSET\r\n";
 const GET_PREFIX: &[u8; 13] = b"*2\r\n$3\r\nGET\r\n";
 const PING_PREFIX: &[u8; 14] = b"*1\r\n$4\r\nPING\r\n";
 
@@ -80,7 +88,28 @@ fn register_client(handle: LoopHandle<'static, ServerData>, stream: TcpStream) {
             if buf.starts_with(SET_PREFIX) {
                 match parse_kv(&buf[SET_PREFIX.len()..n]) {
                     Some((key, value)) => {
-                        data.store.insert(key, value);
+                        data.store.insert(
+                            key,
+                            Entry {
+                                value,
+                                expiry: None,
+                            },
+                        );
+                        _ = tcp.write_all(OK_RESPONSE);
+                    }
+                    None => _ = tcp.write_all(NULL_RESPONSE),
+                }
+            } else if buf.starts_with(SET_EXP_PREFIX) {
+                match parse_kve(&buf[SET_EXP_PREFIX.len()..n]) {
+                    Some((key, value, expiry)) => {
+                        data.store.insert(
+                            key,
+                            Entry {
+                                value,
+                                expiry: Instant::now()
+                                    .checked_add(time::Duration::from_millis(expiry)),
+                            },
+                        );
                         _ = tcp.write_all(OK_RESPONSE);
                     }
                     None => _ = tcp.write_all(NULL_RESPONSE),
@@ -91,7 +120,16 @@ fn register_client(handle: LoopHandle<'static, ServerData>, stream: TcpStream) {
                         let value = data.store.get(&key);
                         match value {
                             Some(v) => {
-                                _ = tcp.write_all(format!("${}\r\n{}\r\n", v.len(), v).as_bytes())
+                                if let Some(e) = v.expiry
+                                    && Instant::now() > e
+                                {
+                                    data.store.remove(&key);
+                                    _ = tcp.write_all(NULL_RESPONSE);
+                                } else {
+                                    _ = tcp.write_all(
+                                        format!("${}\r\n{}\r\n", v.value.len(), v.value).as_bytes(),
+                                    )
+                                }
                             }
                             None => _ = tcp.write_all(NULL_RESPONSE),
                         }
@@ -132,4 +170,22 @@ fn parse_v(buf: &[u8]) -> Option<String> {
         .collect::<Vec<&str>>();
 
     Some(s.get(1)?.to_string())
+}
+
+// input: $3\r\nkey\r\n$5\r\nvalue\r\n$2\r\npx\r\n$3\r\n100\r\n
+fn parse_kve(buf: &[u8]) -> Option<(String, String, u64)> {
+    let s = std::str::from_utf8(buf)
+        .ok()?
+        .split("\r\n")
+        .collect::<Vec<&str>>();
+
+    let key = s.get(1)?.to_string();
+    let value = s.get(3)?.to_string();
+    let mut expiry = s.get(7)?.parse::<u64>().ok()?;
+
+    if s.get(5)?.to_string().to_lowercase() == "ex" {
+        expiry *= 1000;
+    }
+
+    Some((key, value, expiry))
 }
