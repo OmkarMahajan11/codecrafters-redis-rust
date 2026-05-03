@@ -10,7 +10,6 @@ const SET_PREFIX: &[u8; 13] = b"*3\r\n$3\r\nSET\r\n";
 const SET_EXP_PREFIX: &[u8; 13] = b"*5\r\n$3\r\nSET\r\n";
 const GET_PREFIX: &[u8; 13] = b"*2\r\n$3\r\nGET\r\n";
 const PING_PREFIX: &[u8; 14] = b"*1\r\n$4\r\nPING\r\n";
-const RP_PREFIX: &[u8; 15] = b"*3\r\n$5\r\nRPUSH\r\n";
 
 const PONG_RESPONSE: &[u8; 7] = b"+PONG\r\n";
 const NULL_RESPONSE: &[u8; 5] = b"$-1\r\n";
@@ -39,7 +38,7 @@ pub enum Command {
     },
     RPush {
         key: String,
-        value: String,
+        values: Vec<String>,
     },
 }
 
@@ -83,6 +82,24 @@ fn parse_kve(buf: &[u8]) -> Option<(String, String, u64)> {
     Some((key, value, expiry))
 }
 
+fn parse_kvlist(buf: &[u8]) -> Option<(String, Vec<String>)> {
+    let mut l: Vec<String> = std::str::from_utf8(buf)
+        .ok()?
+        .split("\r\n")
+        .filter(|x| !x.is_empty())
+        .filter(|x| !x.starts_with("$"))
+        .filter(|x| !x.starts_with("*"))
+        .filter(|x| *x != "RPUSH")
+        .map(|x| x.to_owned())
+        .collect();
+
+    if l.is_empty() {
+        return None;
+    }
+
+    Some((l.swap_remove(0), l))
+}
+
 pub fn parse_command(buf: &[u8]) -> Option<Command> {
     if buf.starts_with(PING_PREFIX) {
         Some(Command::Ping)
@@ -98,8 +115,8 @@ pub fn parse_command(buf: &[u8]) -> Option<Command> {
         })
     } else if buf.starts_with(GET_PREFIX) {
         parse_v(&buf[GET_PREFIX.len()..]).map(Command::Get)
-    } else if buf.starts_with(RP_PREFIX) {
-        parse_kv(&buf[RP_PREFIX.len()..]).map(|(k, v)| Command::RPush { key: k, value: v })
+    } else if buf.windows(b"RPUSH".len()).any(|w| w == b"RPUSH") {
+        parse_kvlist(buf).map(|(k, vl)| Command::RPush { key: k, values: vl })
     } else {
         None
     }
@@ -150,12 +167,12 @@ pub fn handle_command(
                 None => _ = tcp.write_all(NULL_RESPONSE),
             }
         }
-        Some(Command::RPush { key, value }) => {
+        Some(Command::RPush { key, values }) => {
             let entry = store.entry(key).or_insert_with(|| Entry::List(Vec::new()));
 
             match entry {
                 Entry::List(l) => {
-                    l.push(value);
+                    l.extend(values);
                     _ = tcp.write_all(format!(":{}\r\n", l.len()).as_bytes())
                 }
                 Entry::Single { .. } => _ = tcp.write_all(NULL_RESPONSE),
