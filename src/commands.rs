@@ -14,6 +14,7 @@ const PING_PREFIX: &[u8; 14] = b"*1\r\n$4\r\nPING\r\n";
 const PONG_RESPONSE: &[u8; 7] = b"+PONG\r\n";
 const NULL_RESPONSE: &[u8; 5] = b"$-1\r\n";
 const OK_RESPONSE: &[u8; 5] = b"+OK\r\n";
+const ZERO_ARRAY: &[u8; 4] = b"*0\r\n";
 
 pub enum Entry {
     Single {
@@ -37,8 +38,13 @@ pub enum Command {
         ttl: Duration,
     },
     RPush {
-        key: String,
+        list_key: String,
         values: Vec<String>,
+    },
+    LRange {
+        list_key: String,
+        low: usize,
+        high: usize,
     },
 }
 
@@ -97,7 +103,29 @@ fn parse_kvlist(buf: &[u8]) -> Option<(String, Vec<String>)> {
         return None;
     }
 
-    Some((l.swap_remove(0), l))
+    Some((l.remove(0), l))
+}
+
+fn parse_lrange(buf: &[u8]) -> Option<(String, usize, usize)> {
+    let mut l: Vec<String> = std::str::from_utf8(buf)
+        .ok()?
+        .split("\r\n")
+        .filter(|x| !x.is_empty())
+        .filter(|x| !x.starts_with("$"))
+        .filter(|x| !x.starts_with("*"))
+        .filter(|x| *x != "LRANGE")
+        .map(|x| x.to_owned())
+        .collect();
+
+    if l.is_empty() {
+        return None;
+    }
+
+    Some((
+        l.remove(0),
+        l.get(0)?.parse::<usize>().ok()?,
+        l.get(1)?.parse::<usize>().ok()?,
+    ))
 }
 
 pub fn parse_command(buf: &[u8]) -> Option<Command> {
@@ -116,7 +144,16 @@ pub fn parse_command(buf: &[u8]) -> Option<Command> {
     } else if buf.starts_with(GET_PREFIX) {
         parse_v(&buf[GET_PREFIX.len()..]).map(Command::Get)
     } else if buf.windows(b"RPUSH".len()).any(|w| w == b"RPUSH") {
-        parse_kvlist(buf).map(|(k, vl)| Command::RPush { key: k, values: vl })
+        parse_kvlist(buf).map(|(k, vl)| Command::RPush {
+            list_key: k,
+            values: vl,
+        })
+    } else if buf.windows(b"LRANGE".len()).any(|w| w == b"LRANGE") {
+        parse_lrange(buf).map(|(list_key, low, high)| Command::LRange {
+            list_key,
+            low,
+            high,
+        })
     } else {
         None
     }
@@ -161,13 +198,14 @@ pub fn handle_command(
                         _ = tcp.write_all(format!("${}\r\n{}\r\n", value.len(), value).as_bytes())
                     }
                 }
-                Some(Entry::List(_)) => {
-                    _ = tcp.write_all(NULL_RESPONSE);
-                }
+                Some(Entry::List(_)) => _ = tcp.write_all(NULL_RESPONSE),
                 None => _ = tcp.write_all(NULL_RESPONSE),
             }
         }
-        Some(Command::RPush { key, values }) => {
+        Some(Command::RPush {
+            list_key: key,
+            values,
+        }) => {
             let entry = store.entry(key).or_insert_with(|| Entry::List(Vec::new()));
 
             match entry {
@@ -183,6 +221,37 @@ pub fn handle_command(
         }
         Some(Command::Ping) => {
             _ = tcp.write_all(PONG_RESPONSE);
+        }
+        Some(Command::LRange {
+            list_key,
+            low,
+            mut high,
+        }) => {
+            if low > high {
+                _ = tcp.write_all(ZERO_ARRAY);
+                return;
+            }
+
+            let entry = store.get(&list_key);
+            match entry {
+                Some(Entry::List(l)) => {
+                    if low >= l.len() {
+                        _ = tcp.write_all(ZERO_ARRAY);
+                        return;
+                    }
+                    if high >= l.len() {
+                        high = l.len() - 1;
+                    }
+                    let slice = &l[low..=high];
+                    let mut response = format!("*{}\r\n", slice.len());
+                    for item in slice {
+                        response.push_str(&format!("${}\r\n{}\r\n", item.len(), item));
+                    }
+                    _ = tcp.write_all(response.as_bytes());
+                }
+                Some(Entry::Single { .. }) => _ = tcp.write_all(ZERO_ARRAY),
+                None => _ = tcp.write_all(ZERO_ARRAY),
+            }
         }
         None => {
             _ = tcp.write_all(NULL_RESPONSE);
