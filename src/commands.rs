@@ -43,8 +43,8 @@ pub enum Command {
     },
     LRange {
         list_key: String,
-        low: usize,
-        high: usize,
+        low: i8,
+        high: i8,
     },
 }
 
@@ -106,7 +106,7 @@ fn parse_kvlist(buf: &[u8]) -> Option<(String, Vec<String>)> {
     Some((l.remove(0), l))
 }
 
-fn parse_lrange(buf: &[u8]) -> Option<(String, usize, usize)> {
+fn parse_lrange(buf: &[u8]) -> Option<(String, i8, i8)> {
     let mut l: Vec<String> = std::str::from_utf8(buf)
         .ok()?
         .split("\r\n")
@@ -123,8 +123,8 @@ fn parse_lrange(buf: &[u8]) -> Option<(String, usize, usize)> {
 
     Some((
         l.remove(0),
-        l.get(0)?.parse::<usize>().ok()?,
-        l.get(1)?.parse::<usize>().ok()?,
+        l.get(0)?.parse::<i8>().ok()?,
+        l.get(1)?.parse::<i8>().ok()?,
     ))
 }
 
@@ -225,24 +225,30 @@ pub fn handle_command(
         Some(Command::LRange {
             list_key,
             low,
-            mut high,
+            high,
         }) => {
-            if low > high {
-                _ = tcp.write_all(ZERO_ARRAY);
-                return;
-            }
-
             let entry = store.get(&list_key);
+
             match entry {
                 Some(Entry::List(l)) => {
-                    if low >= l.len() {
+                    let mut low = if low < 0 { l.len() as i8 + low } else { low };
+                    let mut high = if high < 0 { l.len() as i8 + high } else { high };
+
+                    if low < 0 {
+                        low = 0
+                    };
+                    if high < 0 {
+                        high = 0
+                    };
+
+                    if low >= l.len() as i8 || low > high {
                         _ = tcp.write_all(ZERO_ARRAY);
                         return;
                     }
-                    if high >= l.len() {
-                        high = l.len() - 1;
+                    if high >= l.len() as i8 {
+                        high = l.len() as i8 - 1;
                     }
-                    let slice = &l[low..=high];
+                    let slice = &l[low as usize..=high as usize];
                     let mut response = format!("*{}\r\n", slice.len());
                     for item in slice {
                         response.push_str(&format!("${}\r\n{}\r\n", item.len(), item));
@@ -251,6 +257,11 @@ pub fn handle_command(
                 }
                 Some(Entry::Single { .. }) => _ = tcp.write_all(ZERO_ARRAY),
                 None => _ = tcp.write_all(ZERO_ARRAY),
+            }
+
+            if low > high {
+                _ = tcp.write_all(ZERO_ARRAY);
+                return;
             }
         }
         None => {
