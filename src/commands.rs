@@ -258,11 +258,6 @@ pub fn handle_command(
                 Some(Entry::Single { .. }) => _ = tcp.write_all(ZERO_ARRAY),
                 None => _ = tcp.write_all(ZERO_ARRAY),
             }
-
-            if low > high {
-                _ = tcp.write_all(ZERO_ARRAY);
-                return;
-            }
         }
         None => {
             _ = tcp.write_all(NULL_RESPONSE);
