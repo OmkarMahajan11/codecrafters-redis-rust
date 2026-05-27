@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io::Write,
     net::TcpStream,
     time::{Duration, Instant},
@@ -11,6 +11,7 @@ const SET_EXP_PREFIX: &[u8; 13] = b"*5\r\n$3\r\nSET\r\n";
 const GET_PREFIX: &[u8; 13] = b"*2\r\n$3\r\nGET\r\n";
 const PING_PREFIX: &[u8; 14] = b"*1\r\n$4\r\nPING\r\n";
 const LLEN_PREFIX: &[u8; 14] = b"*2\r\n$4\r\nLLEN\r\n";
+const LPOP_PREFIX: &[u8; 14] = b"*2\r\n$4\r\nLPOP\r\n";
 
 const PONG_RESPONSE: &[u8; 7] = b"+PONG\r\n";
 const NULL_RESPONSE: &[u8; 5] = b"$-1\r\n";
@@ -22,7 +23,7 @@ pub enum Entry {
         value: String,
         expiry: Option<Instant>,
     },
-    List(Vec<String>),
+    List(VecDeque<String>),
 }
 
 pub enum Command {
@@ -52,6 +53,7 @@ pub enum Command {
         values: Vec<String>,
     },
     LLen(String),
+    LPop(String),
 }
 
 fn parse_kv(buf: &[u8]) -> Option<(String, String)> {
@@ -169,6 +171,8 @@ pub fn parse_command(buf: &[u8]) -> Option<Command> {
         parse_v(&buf[GET_PREFIX.len()..]).map(Command::Get)
     } else if buf.starts_with(LLEN_PREFIX) {
         parse_v(&buf[LLEN_PREFIX.len()..]).map(Command::LLen)
+    } else if buf.starts_with(LPOP_PREFIX) {
+        parse_v(&buf[LPOP_PREFIX.len()..]).map(Command::LPop)
     } else if buf.windows(b"RPUSH".len()).any(|w| w == b"RPUSH") {
         parse_rpush(buf).map(|(k, vl)| Command::RPush {
             list_key: k,
@@ -237,12 +241,12 @@ pub fn handle_command(
             list_key: key,
             values,
         }) => {
-            let entry = store.entry(key).or_insert_with(|| Entry::List(Vec::new()));
+            let entry = store.entry(key).or_insert_with(|| Entry::List(VecDeque::new()));
 
             match entry {
                 Entry::List(l) => {
                     for v in values {
-                        l.insert(0, v);
+                        l.push_front(v);
                     }
                     _ = tcp.write_all(format!(":{}\r\n", l.len()).as_bytes())
                 }
@@ -253,11 +257,13 @@ pub fn handle_command(
             list_key: key,
             values,
         }) => {
-            let entry = store.entry(key).or_insert_with(|| Entry::List(Vec::new()));
+            let entry = store.entry(key).or_insert_with(|| Entry::List(VecDeque::new()));
 
             match entry {
                 Entry::List(l) => {
-                    l.extend(values);
+                    for v in values {
+                        l.push_back(v);
+                    }
                     _ = tcp.write_all(format!(":{}\r\n", l.len()).as_bytes())
                 }
                 Entry::Single { .. } => _ = tcp.write_all(NULL_RESPONSE),
@@ -278,8 +284,9 @@ pub fn handle_command(
 
             match entry {
                 Some(Entry::List(l)) => {
-                    let mut low = if low < 0 { l.len() as i8 + low } else { low };
-                    let mut high = if high < 0 { l.len() as i8 + high } else { high };
+                    let len = l.len() as isize;
+                    let mut low = if low < 0 { len + low as isize } else { low as isize };
+                    let mut high = if high < 0 { len + high as isize } else { high as isize };
 
                     if low < 0 {
                         low = 0
@@ -288,17 +295,18 @@ pub fn handle_command(
                         high = 0
                     };
 
-                    if low >= l.len() as i8 || low > high {
+                    if low >= len || low > high {
                         _ = tcp.write_all(ZERO_ARRAY);
                         return;
                     }
-                    if high >= l.len() as i8 {
-                        high = l.len() as i8 - 1;
+                    if high >= len {
+                        high = len - 1;
                     }
-                    let slice = &l[low as usize..=high as usize];
-                    let mut response = format!("*{}\r\n", slice.len());
-                    for item in slice {
-                        response.push_str(&format!("${}\r\n{}\r\n", item.len(), item));
+                    let mut response = format!("*{}\r\n", high - low + 1);
+                    for i in low..=high {
+                        if let Some(item) = l.get(i as usize) {
+                            response.push_str(&format!("${}\r\n{}\r\n", item.len(), item));
+                        }
                     }
                     _ = tcp.write_all(response.as_bytes());
                 }
@@ -307,11 +315,26 @@ pub fn handle_command(
             }
         }
         Some(Command::LLen(key)) => {
-            let entry = store.entry(key).or_insert_with(|| Entry::List(Vec::new()));
+            let entry = store.entry(key).or_insert_with(|| Entry::List(VecDeque::new()));
 
             match entry {
                 Entry::List(l) => _ = tcp.write_all(format!(":{}\r\n", l.len()).as_bytes()),
                 Entry::Single { .. } => _ = tcp.write_all(NULL_RESPONSE),
+            }
+        }
+        Some(Command::LPop(key)) => {
+            match store.get_mut(&key) {
+                Some(Entry::List(l)) => match l.pop_front() {
+                    Some(value) => {
+                        _ = tcp.write_all(format!("${}\r\n{}\r\n", value.len(), value).as_bytes());
+                        if l.is_empty() {
+                            store.remove(&key);
+                        }
+                    }
+                    None => _ = tcp.write_all(NULL_RESPONSE),
+                },
+                Some(Entry::Single { .. }) => _ = tcp.write_all(NULL_RESPONSE),
+                None => _ = tcp.write_all(NULL_RESPONSE),
             }
         }
         None => {
