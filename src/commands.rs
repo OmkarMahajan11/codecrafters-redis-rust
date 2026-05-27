@@ -10,6 +10,7 @@ const SET_PREFIX: &[u8; 13] = b"*3\r\n$3\r\nSET\r\n";
 const SET_EXP_PREFIX: &[u8; 13] = b"*5\r\n$3\r\nSET\r\n";
 const GET_PREFIX: &[u8; 13] = b"*2\r\n$3\r\nGET\r\n";
 const PING_PREFIX: &[u8; 14] = b"*1\r\n$4\r\nPING\r\n";
+const LLEN_PREFIX: &[u8; 14] = b"*2\r\n$4\r\nLLEN\r\n";
 
 const PONG_RESPONSE: &[u8; 7] = b"+PONG\r\n";
 const NULL_RESPONSE: &[u8; 5] = b"$-1\r\n";
@@ -50,6 +51,7 @@ pub enum Command {
         list_key: String,
         values: Vec<String>,
     },
+    LLen(String),
 }
 
 fn parse_kv(buf: &[u8]) -> Option<(String, String)> {
@@ -165,6 +167,8 @@ pub fn parse_command(buf: &[u8]) -> Option<Command> {
         })
     } else if buf.starts_with(GET_PREFIX) {
         parse_v(&buf[GET_PREFIX.len()..]).map(Command::Get)
+    } else if buf.starts_with(LLEN_PREFIX) {
+        parse_v(&buf[LLEN_PREFIX.len()..]).map(Command::LLen)
     } else if buf.windows(b"RPUSH".len()).any(|w| w == b"RPUSH") {
         parse_rpush(buf).map(|(k, vl)| Command::RPush {
             list_key: k,
@@ -300,6 +304,14 @@ pub fn handle_command(
                 }
                 Some(Entry::Single { .. }) => _ = tcp.write_all(ZERO_ARRAY),
                 None => _ = tcp.write_all(ZERO_ARRAY),
+            }
+        }
+        Some(Command::LLen(key)) => {
+            let entry = store.entry(key).or_insert_with(|| Entry::List(Vec::new()));
+
+            match entry {
+                Entry::List(l) => _ = tcp.write_all(format!(":{}\r\n", l.len()).as_bytes()),
+                Entry::Single { .. } => _ = tcp.write_all(NULL_RESPONSE),
             }
         }
         None => {
