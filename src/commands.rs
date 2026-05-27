@@ -11,7 +11,6 @@ const SET_EXP_PREFIX: &[u8; 13] = b"*5\r\n$3\r\nSET\r\n";
 const GET_PREFIX: &[u8; 13] = b"*2\r\n$3\r\nGET\r\n";
 const PING_PREFIX: &[u8; 14] = b"*1\r\n$4\r\nPING\r\n";
 const LLEN_PREFIX: &[u8; 14] = b"*2\r\n$4\r\nLLEN\r\n";
-const LPOP_PREFIX: &[u8; 14] = b"*2\r\n$4\r\nLPOP\r\n";
 
 const PONG_RESPONSE: &[u8; 7] = b"+PONG\r\n";
 const NULL_RESPONSE: &[u8; 5] = b"$-1\r\n";
@@ -53,7 +52,7 @@ pub enum Command {
         values: Vec<String>,
     },
     LLen(String),
-    LPop(String),
+    LPop { key: String, count: usize },
 }
 
 fn parse_kv(buf: &[u8]) -> Option<(String, String)> {
@@ -154,6 +153,21 @@ fn parse_lrange(buf: &[u8]) -> Option<(String, i8, i8)> {
     ))
 }
 
+fn parse_lpop(buf: &[u8]) -> Option<(String, usize)> {
+    let parts: Vec<String> = std::str::from_utf8(buf)
+        .ok()?
+        .split("\r\n")
+        .filter(|x| !x.is_empty())
+        .filter(|x| !x.starts_with("$"))
+        .filter(|x| !x.starts_with("*"))
+        .map(|x| x.to_owned())
+        .collect();
+
+    let key = parts.get(1)?.clone();
+    let count = parts.get(2).and_then(|c| c.parse::<usize>().ok()).unwrap_or(1);
+    Some((key, count))
+}
+
 pub fn parse_command(buf: &[u8]) -> Option<Command> {
     if buf.starts_with(PING_PREFIX) {
         Some(Command::Ping)
@@ -171,8 +185,8 @@ pub fn parse_command(buf: &[u8]) -> Option<Command> {
         parse_v(&buf[GET_PREFIX.len()..]).map(Command::Get)
     } else if buf.starts_with(LLEN_PREFIX) {
         parse_v(&buf[LLEN_PREFIX.len()..]).map(Command::LLen)
-    } else if buf.starts_with(LPOP_PREFIX) {
-        parse_v(&buf[LPOP_PREFIX.len()..]).map(Command::LPop)
+    } else if buf.windows(b"LPOP".len()).any(|w| w == b"LPOP") {
+        parse_lpop(buf).map(|(key, count)| Command::LPop { key, count })
     } else if buf.windows(b"RPUSH".len()).any(|w| w == b"RPUSH") {
         parse_rpush(buf).map(|(k, vl)| Command::RPush {
             list_key: k,
@@ -322,17 +336,36 @@ pub fn handle_command(
                 Entry::Single { .. } => _ = tcp.write_all(NULL_RESPONSE),
             }
         }
-        Some(Command::LPop(key)) => {
+        Some(Command::LPop { key, count }) => {
             match store.get_mut(&key) {
-                Some(Entry::List(l)) => match l.pop_front() {
-                    Some(value) => {
-                        _ = tcp.write_all(format!("${}\r\n{}\r\n", value.len(), value).as_bytes());
-                        if l.is_empty() {
-                            store.remove(&key);
+                Some(Entry::List(l)) => {
+                    let pop_count = count.min(l.len());
+                    if pop_count == 0 {
+                        _ = tcp.write_all(NULL_RESPONSE);
+                        return;
+                    }
+
+                    let mut values: Vec<String> = Vec::with_capacity(pop_count);
+                    for _ in 0..pop_count {
+                        if let Some(v) = l.pop_front() {
+                            values.push(v);
                         }
                     }
-                    None => _ = tcp.write_all(NULL_RESPONSE),
-                },
+
+                    if values.len() == 1 && count == 1 {
+                        _ = tcp.write_all(format!("${}\r\n{}\r\n", values[0].len(), values[0]).as_bytes());
+                    } else {
+                        let mut response = format!("*{}\r\n", values.len());
+                        for v in &values {
+                            response.push_str(&format!("${}\r\n{}\r\n", v.len(), v));
+                        }
+                        _ = tcp.write_all(response.as_bytes());
+                    }
+
+                    if l.is_empty() {
+                        store.remove(&key);
+                    }
+                }
                 Some(Entry::Single { .. }) => _ = tcp.write_all(NULL_RESPONSE),
                 None => _ = tcp.write_all(NULL_RESPONSE),
             }
