@@ -46,6 +46,10 @@ pub enum Command {
         low: i8,
         high: i8,
     },
+    LPush {
+        list_key: String,
+        values: Vec<String>,
+    },
 }
 
 fn parse_kv(buf: &[u8]) -> Option<(String, String)> {
@@ -88,7 +92,7 @@ fn parse_kve(buf: &[u8]) -> Option<(String, String, u64)> {
     Some((key, value, expiry))
 }
 
-fn parse_kvlist(buf: &[u8]) -> Option<(String, Vec<String>)> {
+fn parse_rpush(buf: &[u8]) -> Option<(String, Vec<String>)> {
     let mut l: Vec<String> = std::str::from_utf8(buf)
         .ok()?
         .split("\r\n")
@@ -96,6 +100,24 @@ fn parse_kvlist(buf: &[u8]) -> Option<(String, Vec<String>)> {
         .filter(|x| !x.starts_with("$"))
         .filter(|x| !x.starts_with("*"))
         .filter(|x| *x != "RPUSH")
+        .map(|x| x.to_owned())
+        .collect();
+
+    if l.is_empty() {
+        return None;
+    }
+
+    Some((l.remove(0), l))
+}
+
+fn parse_lpush(buf: &[u8]) -> Option<(String, Vec<String>)> {
+    let mut l: Vec<String> = std::str::from_utf8(buf)
+        .ok()?
+        .split("\r\n")
+        .filter(|x| !x.is_empty())
+        .filter(|x| !x.starts_with("$"))
+        .filter(|x| !x.starts_with("*"))
+        .filter(|x| *x != "LPUSH")
         .map(|x| x.to_owned())
         .collect();
 
@@ -144,7 +166,12 @@ pub fn parse_command(buf: &[u8]) -> Option<Command> {
     } else if buf.starts_with(GET_PREFIX) {
         parse_v(&buf[GET_PREFIX.len()..]).map(Command::Get)
     } else if buf.windows(b"RPUSH".len()).any(|w| w == b"RPUSH") {
-        parse_kvlist(buf).map(|(k, vl)| Command::RPush {
+        parse_rpush(buf).map(|(k, vl)| Command::RPush {
+            list_key: k,
+            values: vl,
+        })
+    } else if buf.windows(b"LPUSH".len()).any(|w| w == b"LPUSH") {
+        parse_lpush(buf).map(|(k, vl)| Command::LPush {
             list_key: k,
             values: vl,
         })
@@ -200,6 +227,22 @@ pub fn handle_command(
                 }
                 Some(Entry::List(_)) => _ = tcp.write_all(NULL_RESPONSE),
                 None => _ = tcp.write_all(NULL_RESPONSE),
+            }
+        }
+        Some(Command::LPush {
+            list_key: key,
+            values,
+        }) => {
+            let entry = store.entry(key).or_insert_with(|| Entry::List(Vec::new()));
+
+            match entry {
+                Entry::List(l) => {
+                    for v in values {
+                        l.insert(0, v);
+                    }
+                    _ = tcp.write_all(format!(":{}\r\n", l.len()).as_bytes())
+                }
+                Entry::Single { .. } => _ = tcp.write_all(NULL_RESPONSE),
             }
         }
         Some(Command::RPush {
